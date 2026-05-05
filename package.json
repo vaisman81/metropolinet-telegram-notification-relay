@@ -11,6 +11,8 @@
   },
   "keywords": [
     "telegram",
+    "gmail",
+    "imap",
     "microsoft-graph",
     "power-automate",
     "outlook",
@@ -23,6 +25,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "imapflow": "^1.0.181"
   }
 }
