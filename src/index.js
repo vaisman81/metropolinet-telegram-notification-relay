@@ -193,8 +193,12 @@ function normalizeString(value) {
 }
 
 function formatTelegramMessage({ from, subject, received }) {
+  const ticketId = extractTicketId(subject);
+
   if (TELEGRAM_INCLUDE_DETAILS.toLowerCase() !== 'true') {
-    return escapeHtml(TELEGRAM_ALERT_TITLE);
+    return ticketId
+      ? `${escapeHtml(TELEGRAM_ALERT_TITLE)}: <b>${escapeHtml(ticketId)}</b>`
+      : escapeHtml(TELEGRAM_ALERT_TITLE);
   }
 
   return [
@@ -228,6 +232,11 @@ function escapeHtml(value) {
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;');
+}
+
+function extractTicketId(subject) {
+  const match = normalizeString(subject).match(/##([A-Z]+-\d+)##/i);
+  return match ? match[1].toUpperCase() : '';
 }
 
 async function sendTelegramMessage(text) {
