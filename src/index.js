@@ -3,12 +3,23 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import express from 'express';
+import { ImapFlow } from 'imapflow';
 
 const {
   PORT = '3000',
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   SHARED_SECRET,
+  GMAIL_POLLING_ENABLED = 'false',
+  GMAIL_POLL_INTERVAL_SECONDS = '120',
+  GMAIL_STATE_FILE = '.data/gmail-state.json',
+  GMAIL_IMAP_HOST = 'imap.gmail.com',
+  GMAIL_IMAP_PORT = '993',
+  GMAIL_IMAP_SECURE = 'true',
+  GMAIL_IMAP_USER,
+  GMAIL_IMAP_PASSWORD,
+  GMAIL_IMAP_MAILBOX = 'INBOX',
+  GMAIL_IMAP_MARK_SEEN = 'true',
   GRAPH_POLLING_ENABLED = 'false',
   GRAPH_POLL_INTERVAL_SECONDS = '120',
   GRAPH_LOOKBACK_MINUTES = '5',
@@ -26,6 +37,7 @@ const REQUIRED_ENV = {
   TELEGRAM_CHAT_ID,
 };
 
+const isGmailPollingEnabled = GMAIL_POLLING_ENABLED.toLowerCase() === 'true';
 const isGraphPollingEnabled = GRAPH_POLLING_ENABLED.toLowerCase() === 'true';
 
 if (SHARED_SECRET) {
@@ -37,6 +49,13 @@ if (isGraphPollingEnabled) {
     MS_TENANT_ID,
     MS_CLIENT_ID,
     MS_REFRESH_TOKEN,
+  });
+}
+
+if (isGmailPollingEnabled) {
+  Object.assign(REQUIRED_ENV, {
+    GMAIL_IMAP_USER,
+    GMAIL_IMAP_PASSWORD,
   });
 }
 
@@ -57,6 +76,8 @@ const app = express();
 let graphPollTimer;
 let graphPollInProgress = false;
 let currentMicrosoftRefreshToken = MS_REFRESH_TOKEN;
+let gmailPollTimer;
+let gmailPollInProgress = false;
 
 app.use(
   express.json({
@@ -121,6 +142,10 @@ app.use((err, _req, res, _next) => {
 
 app.listen(Number(PORT), () => {
   console.info(`Notification relay is listening on port ${PORT}`);
+
+  if (isGmailPollingEnabled) {
+    startGmailPolling();
+  }
 
   if (isGraphPollingEnabled) {
     startGraphPolling();
@@ -227,6 +252,106 @@ async function readTelegramResponse(response) {
   } catch {
     return null;
   }
+}
+
+function startGmailPolling() {
+  const intervalMs = Math.max(Number(GMAIL_POLL_INTERVAL_SECONDS) || 120, 30) * 1000;
+
+  console.info('Gmail IMAP polling is enabled', {
+    mailbox: GMAIL_IMAP_MAILBOX,
+    username: GMAIL_IMAP_USER,
+    keyword: TODO_SUBJECT_KEYWORD,
+    intervalSeconds: intervalMs / 1000,
+  });
+
+  void pollGmailInbox();
+  gmailPollTimer = setInterval(() => {
+    void pollGmailInbox();
+  }, intervalMs);
+  gmailPollTimer.unref?.();
+}
+
+async function pollGmailInbox() {
+  if (gmailPollInProgress) {
+    return;
+  }
+
+  const requestId = randomUUID();
+  gmailPollInProgress = true;
+
+  try {
+    const state = await loadMessageState(GMAIL_STATE_FILE);
+    const client = new ImapFlow({
+      host: GMAIL_IMAP_HOST,
+      port: Number(GMAIL_IMAP_PORT),
+      secure: GMAIL_IMAP_SECURE.toLowerCase() === 'true',
+      auth: {
+        user: GMAIL_IMAP_USER,
+        pass: GMAIL_IMAP_PASSWORD,
+      },
+      logger: false,
+    });
+
+    await client.connect();
+    await client.mailboxOpen(GMAIL_IMAP_MAILBOX, { readOnly: false });
+
+    const unseen = await client.search({ seen: false });
+
+    for (const uid of unseen) {
+      const message = await client.fetchOne(uid, {
+        uid: true,
+        envelope: true,
+        internalDate: true,
+        flags: true,
+      });
+
+      const messageId = normalizeString(message?.envelope?.messageId) || `uid:${uid}`;
+      const subject = normalizeString(message?.envelope?.subject);
+
+      if (state.seenMessageIds.includes(messageId)) {
+        continue;
+      }
+
+      if (!subject.toLowerCase().includes(TODO_SUBJECT_KEYWORD.toLowerCase())) {
+        continue;
+      }
+
+      const from = getImapEnvelopeSender(message?.envelope);
+      const received = message?.internalDate?.toISOString() || new Date().toISOString();
+
+      await sendTelegramMessage(formatTelegramMessage({ from, subject, received }));
+
+      if (GMAIL_IMAP_MARK_SEEN.toLowerCase() === 'true') {
+        await client.messageFlagsAdd(uid, ['\\Seen']);
+      }
+
+      state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
+      state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, messageId]);
+      await saveMessageState(GMAIL_STATE_FILE, state);
+
+      console.info(`[${requestId}] Gmail TODO notification sent`, {
+        uid,
+        messageId,
+        from,
+        subjectLength: subject.length,
+        received,
+      });
+    }
+
+    await client.logout();
+  } catch (error) {
+    console.error(`[${requestId}] Gmail polling error`, {
+      message: error.message,
+      code: error.code,
+    });
+  } finally {
+    gmailPollInProgress = false;
+  }
+}
+
+function getImapEnvelopeSender(envelope) {
+  const sender = envelope?.from?.[0];
+  return normalizeString(sender?.address) || normalizeString(sender?.name) || 'unknown';
 }
 
 function startGraphPolling() {
@@ -387,8 +512,16 @@ function getGraphMessageSender(message) {
 }
 
 async function loadGraphState() {
+  return loadMessageState(GRAPH_STATE_FILE);
+}
+
+async function saveGraphState(state) {
+  return saveMessageState(GRAPH_STATE_FILE, state);
+}
+
+async function loadMessageState(stateFile) {
   try {
-    const raw = await readFile(GRAPH_STATE_FILE, 'utf8');
+    const raw = await readFile(stateFile, 'utf8');
     const parsed = JSON.parse(raw);
 
     return {
@@ -411,10 +544,10 @@ async function loadGraphState() {
   }
 }
 
-async function saveGraphState(state) {
-  await mkdir(path.dirname(GRAPH_STATE_FILE), { recursive: true });
+async function saveMessageState(stateFile, state) {
+  await mkdir(path.dirname(stateFile), { recursive: true });
   await writeFile(
-    GRAPH_STATE_FILE,
+    stateFile,
     `${JSON.stringify(
       {
         lastReceivedDateTime: state.lastReceivedDateTime,
