@@ -20,6 +20,9 @@ const {
   GMAIL_IMAP_PASSWORD,
   GMAIL_IMAP_MAILBOX = 'INBOX',
   GMAIL_IMAP_MARK_SEEN = 'true',
+  GMAIL_BOOTSTRAP_SKIP_EXISTING = 'false',
+  GMAIL_FILTER_FROM_CONTAINS = '',
+  GMAIL_FILTER_SUBJECT_CONTAINS = '',
   GRAPH_POLLING_ENABLED = 'false',
   GRAPH_POLL_INTERVAL_SECONDS = '120',
   GRAPH_LOOKBACK_MINUTES = '5',
@@ -30,6 +33,8 @@ const {
   MS_CLIENT_SECRET,
   MS_REFRESH_TOKEN,
   MS_MAILBOX_USER = 'me',
+  TELEGRAM_ALERT_TITLE = 'Новая задача в Metropolinet',
+  TELEGRAM_INCLUDE_DETAILS = 'true',
 } = process.env;
 
 const REQUIRED_ENV = {
@@ -188,8 +193,12 @@ function normalizeString(value) {
 }
 
 function formatTelegramMessage({ from, subject, received }) {
+  if (TELEGRAM_INCLUDE_DETAILS.toLowerCase() !== 'true') {
+    return escapeHtml(TELEGRAM_ALERT_TITLE);
+  }
+
   return [
-    '<b>Новая задача в Metropolinet</b>',
+    `<b>${escapeHtml(TELEGRAM_ALERT_TITLE)}</b>`,
     `От: ${escapeHtml(from)}`,
     `Тема: ${escapeHtml(subject)}`,
     `Получено: ${escapeHtml(formatReceivedTime(received))}`,
@@ -260,7 +269,8 @@ function startGmailPolling() {
   console.info('Gmail IMAP polling is enabled', {
     mailbox: GMAIL_IMAP_MAILBOX,
     username: GMAIL_IMAP_USER,
-    keyword: TODO_SUBJECT_KEYWORD,
+    fromFilter: GMAIL_FILTER_FROM_CONTAINS,
+    subjectFilter: GMAIL_FILTER_SUBJECT_CONTAINS,
     intervalSeconds: intervalMs / 1000,
   });
 
@@ -302,6 +312,32 @@ async function pollGmailInbox() {
     await client.mailboxOpen(GMAIL_IMAP_MAILBOX, { readOnly: false });
 
     const unseen = await client.search({ seen: false });
+    const hasExistingState = state.seenMessageIds.length > 0 || Boolean(state.lastReceivedDateTime);
+
+    if (!hasExistingState && GMAIL_BOOTSTRAP_SKIP_EXISTING.toLowerCase() === 'true' && unseen.length > 0) {
+      const seededMessageIds = [];
+
+      for (const uid of unseen) {
+        const message = await client.fetchOne(uid, {
+          uid: true,
+          envelope: true,
+          internalDate: true,
+        });
+        const messageId = normalizeString(message?.envelope?.messageId) || `uid:${uid}`;
+        const received = message?.internalDate?.toISOString() || '';
+        seededMessageIds.push(messageId);
+        state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
+      }
+
+      state.seenMessageIds = trimSeenMessageIds(seededMessageIds);
+      await saveMessageState(GMAIL_STATE_FILE, state);
+      console.info(`[${requestId}] Seeded Gmail state without sending notifications`, {
+        mailbox: GMAIL_IMAP_MAILBOX,
+        seededCount: seededMessageIds.length,
+      });
+      await client.logout();
+      return;
+    }
 
     for (const uid of unseen) {
       const message = await client.fetchOne(uid, {
@@ -318,12 +354,12 @@ async function pollGmailInbox() {
         continue;
       }
 
-      if (!subject.toLowerCase().includes(TODO_SUBJECT_KEYWORD.toLowerCase())) {
-        continue;
-      }
-
       const from = getImapEnvelopeSender(message?.envelope);
       const received = message?.internalDate?.toISOString() || new Date().toISOString();
+
+      if (!matchesGmailFilters({ from, subject })) {
+        continue;
+      }
 
       await sendTelegramMessage(formatTelegramMessage({ from, subject, received }));
 
@@ -335,7 +371,7 @@ async function pollGmailInbox() {
       state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, messageId]);
       await saveMessageState(GMAIL_STATE_FILE, state);
 
-      console.info(`[${requestId}] Gmail TODO notification sent`, {
+      console.info(`[${requestId}] Gmail filtered notification sent`, {
         uid,
         messageId,
         from,
@@ -358,6 +394,27 @@ async function pollGmailInbox() {
 function getImapEnvelopeSender(envelope) {
   const sender = envelope?.from?.[0];
   return normalizeString(sender?.address) || normalizeString(sender?.name) || 'unknown';
+}
+
+function matchesGmailFilters({ from, subject }) {
+  const normalizedSubject = normalizeString(subject).toLowerCase();
+  const normalizedFrom = normalizeString(from).toLowerCase();
+  const fromFilter = normalizeString(GMAIL_FILTER_FROM_CONTAINS).toLowerCase();
+  const subjectFilter = normalizeString(GMAIL_FILTER_SUBJECT_CONTAINS).toLowerCase();
+
+  if (fromFilter && !normalizedFrom.includes(fromFilter)) {
+    return false;
+  }
+
+  if (subjectFilter && !normalizedSubject.includes(subjectFilter)) {
+    return false;
+  }
+
+  if (!fromFilter && !subjectFilter) {
+    return normalizedSubject.includes(TODO_SUBJECT_KEYWORD.toLowerCase());
+  }
+
+  return true;
 }
 
 function startGraphPolling() {
