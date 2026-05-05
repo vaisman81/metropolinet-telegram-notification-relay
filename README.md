@@ -1,23 +1,15 @@
 # Metropolinet Telegram Notification Relay
 
-Небольшой Node.js + Express сервис для уведомлений в Telegram о новых задачах из Microsoft 365 / Outlook через Power Automate.
+Небольшой Node.js + Express сервис для уведомлений в Telegram о новых задачах из Microsoft 365 / Outlook.
 
-Сервис не читает почтовый ящик напрямую, не хранит письма в базе данных и не логирует полный текст письма. Power Automate отслеживает Outlook и отправляет короткий JSON webhook в этот сервис.
+Есть два режима:
 
-## Что делает сервис
+- **Microsoft Graph polling**: сервис сам проверяет Inbox в Outlook и ищет письма с `TODO` в теме. Это основной вариант без Power Automate Premium.
+- **Power Automate webhook**: Power Automate отправляет HTTP POST в сервис. Этот режим оставлен для совместимости, но action `HTTP` обычно требует Power Automate Premium/trial.
 
-Power Automate отправляет HTTP POST:
+Сервис не сохраняет письма в базу данных и не логирует полный текст письма.
 
-```json
-{
-  "from": "sender@example.com",
-  "subject": "TODO something",
-  "received": "2026-05-05T10:00:00Z",
-  "bodyPreview": "short preview"
-}
-```
-
-Сервис проверяет header `X-Webhook-Secret`, формирует короткое уведомление и отправляет его через Telegram Bot API:
+## Что приходит в Telegram
 
 ```text
 Новая задача в Metropolinet
@@ -33,12 +25,10 @@ Power Automate отправляет HTTP POST:
 - Node.js 18 или новее
 - Telegram bot token
 - Telegram chat_id
-- Любой публичный HTTPS endpoint для Power Automate: Render, Railway, Azure App Service или другой хостинг
-- Power Automate plan/trial, который разрешает action `HTTP`
+- Для бесплатного режима: Azure App Registration с delegated permissions `Mail.Read`, `User.Read`, `offline_access`
+- Для webhook режима: `SHARED_SECRET` и Power Automate plan/trial, который разрешает action `HTTP`
 
 Платные внешние API не используются.
-
-Важно: в Power Automate action `HTTP` может требовать premium plan или trial. Если flow получает состояние `Suspended` с причиной `BillingConsumption`, Outlook connection уже может быть рабочим, но сам flow не включится до активации подходящего Power Automate plan/trial или pay-as-you-go billing.
 
 ## Установка
 
@@ -54,31 +44,10 @@ npm install
 Copy-Item .env.example .env
 ```
 
-Заполните `.env`:
-
-```env
-PORT=3000
-TELEGRAM_BOT_TOKEN=123456789:your_bot_token
-TELEGRAM_CHAT_ID=123456789
-SHARED_SECRET=long-random-secret
-```
-
 Запуск:
 
 ```bash
 npm start
-```
-
-Если на этой Windows-машине `npm` не найден в `PATH`, в проект уже можно положить портативный Node.js/npm и запускать команды через него, например:
-
-```powershell
-.\.tools\node-v24.15.0-win-x64\npm.cmd start
-```
-
-Для локальной разработки:
-
-```bash
-npm run dev
 ```
 
 Проверка:
@@ -87,73 +56,134 @@ npm run dev
 curl http://localhost:3000/health
 ```
 
-Тестовый webhook:
-
-```bash
-curl -X POST http://localhost:3000/webhook/power-automate \
-  -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: long-random-secret" \
-  -d "{\"from\":\"sender@example.com\",\"subject\":\"TODO something\",\"received\":\"2026-05-05T10:00:00Z\",\"bodyPreview\":\"short preview\"}"
-```
-
-На Windows PowerShell:
-
-```powershell
-$body = @{
-  from = "sender@example.com"
-  subject = "TODO something"
-  received = "2026-05-05T10:00:00Z"
-  bodyPreview = "short preview"
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:3000/webhook/power-automate" `
-  -Headers @{ "X-Webhook-Secret" = "long-random-secret" } `
-  -ContentType "application/json" `
-  -Body $body
-```
-
-## Как создать Telegram bot
+## Telegram bot
 
 1. Откройте Telegram и найдите `@BotFather`.
-2. Отправьте команду `/newbot`.
-3. Задайте имя бота и username.
+2. Отправьте `/newbot`.
+3. Задайте имя и username.
 4. BotFather выдаст token вида `123456789:ABC...`.
-5. Запишите его в переменную окружения `TELEGRAM_BOT_TOKEN`.
+5. Запишите token в `TELEGRAM_BOT_TOKEN`.
 
 Не храните token в коде и не публикуйте `.env`.
 
-## Как получить TELEGRAM_CHAT_ID
+## TELEGRAM_CHAT_ID
 
-### Личный чат
-
-1. Напишите любое сообщение созданному боту в Telegram, например `start`.
-2. Откройте в браузере:
+1. Напишите любое сообщение созданному боту, например `/start`.
+2. Откройте:
 
 ```text
 https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates
 ```
 
-3. Найдите в ответе `message.chat.id`.
+3. Найдите `message.chat.id`.
 4. Запишите это значение в `TELEGRAM_CHAT_ID`.
 
-### Группа
+Для группы добавьте бота в группу, отправьте сообщение в группу и так же проверьте `getUpdates`. У групп `chat.id` часто отрицательный.
 
-1. Добавьте бота в группу.
-2. Напишите сообщение в группу.
-3. Откройте:
+## Вариант A: без Power Automate Premium
 
-```text
-https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates
+Этот режим использует Microsoft Graph. Сервис раз в несколько минут проверяет Inbox пользователя `dmitry.vaisman@metropolinet.co.il`, выбирает новые письма с `TODO` в теме и отправляет короткое уведомление в Telegram.
+
+### 1. Azure App Registration
+
+Войдите в Azure Portal тем же Microsoft 365 аккаунтом.
+
+1. Откройте **Microsoft Entra ID**.
+2. Откройте **App registrations**.
+3. Нажмите **New registration**.
+4. Name: `Metropolinet Telegram Notification Relay`.
+5. Supported account types: обычно достаточно `Accounts in this organizational directory only`.
+6. Redirect URI:
+   - Platform: `Web`
+   - URL: `http://localhost:3001/callback`
+7. Создайте приложение.
+
+Скопируйте:
+
+- `Application (client) ID` -> `MS_CLIENT_ID`
+- `Directory (tenant) ID` -> `MS_TENANT_ID`
+
+### 2. API permissions
+
+В созданном приложении откройте **API permissions**:
+
+1. Нажмите **Add a permission**.
+2. Выберите **Microsoft Graph**.
+3. Выберите **Delegated permissions**.
+4. Добавьте:
+   - `Mail.Read`
+   - `User.Read`
+   - `offline_access`
+5. Если Azure попросит admin consent, его должен подтвердить администратор tenant. В некоторых tenant delegated `Mail.Read` может работать после обычного user consent.
+
+### 3. Client secret
+
+В **Certificates & secrets** создайте новый **Client secret**.
+
+Скопируйте `Value` сразу после создания и запишите в `MS_CLIENT_SECRET`. Потом Azure больше не покажет это значение.
+
+### 4. Получить refresh token
+
+Заполните в `.env`:
+
+```env
+MS_TENANT_ID=45abff8b-eeda-41e5-99d4-2e7def6de1fe
+MS_CLIENT_ID=client-id-from-azure
+MS_CLIENT_SECRET=secret-value-from-azure
+MS_REDIRECT_URI=http://localhost:3001/callback
 ```
 
-4. Найдите `message.chat.id`. Для групп значение часто отрицательное.
-5. Если бот должен писать в группу, убедитесь, что он не заблокирован настройками privacy или правами группы.
+Запустите:
 
-## Endpoint
+```bash
+npm run auth:microsoft
+```
 
-Основной endpoint:
+Скрипт напечатает ссылку Microsoft sign-in. Откройте её в браузере, войдите в аккаунт `dmitry.vaisman@metropolinet.co.il` и разрешите доступ. После callback скрипт напечатает:
+
+```env
+MS_REFRESH_TOKEN=...
+```
+
+Добавьте это значение в `.env` и в environment variables на Render/Railway/Azure.
+
+### 5. Включить polling
+
+Минимальные переменные:
+
+```env
+TELEGRAM_BOT_TOKEN=123456789:your_bot_token
+TELEGRAM_CHAT_ID=123456789
+
+GRAPH_POLLING_ENABLED=true
+GRAPH_POLL_INTERVAL_SECONDS=120
+GRAPH_LOOKBACK_MINUTES=5
+TODO_SUBJECT_KEYWORD=TODO
+MS_TENANT_ID=45abff8b-eeda-41e5-99d4-2e7def6de1fe
+MS_CLIENT_ID=client-id-from-azure
+MS_CLIENT_SECRET=secret-value-from-azure
+MS_REFRESH_TOKEN=refresh-token-from-helper
+MS_MAILBOX_USER=dmitry.vaisman@metropolinet.co.il
+```
+
+`GRAPH_LOOKBACK_MINUTES=5` означает: при первом запуске сервис проверит только последние 5 минут, чтобы не отправить старые письма. Дальше он хранит минимальное состояние в `.data/graph-state.json`: последнее время письма и последние обработанные message ids. Текст писем там не сохраняется.
+
+Важно для Render Free: web service может засыпать при отсутствии HTTP-трафика. Когда он спит, polling тоже не выполняется. Для стабильной бесплатной работы добавьте внешний ping на `/health` или используйте другой always-on хостинг.
+
+## Вариант B: Power Automate webhook
+
+Power Automate отправляет HTTP POST:
+
+```json
+{
+  "from": "sender@example.com",
+  "subject": "TODO something",
+  "received": "2026-05-05T10:00:00Z",
+  "bodyPreview": "short preview"
+}
+```
+
+Endpoint:
 
 ```text
 POST /webhook/power-automate
@@ -174,27 +204,17 @@ X-Webhook-Secret: значение SHARED_SECRET
 
 Ошибки:
 
-- `400` — пустое или неправильное тело запроса
-- `401` — неправильный `X-Webhook-Secret`
-- `502` — Telegram API вернул ошибку
-- `500` — внутренняя ошибка сервиса
+- `400` - пустое или неправильное тело запроса
+- `401` - неправильный `X-Webhook-Secret`
+- `502` - Telegram API вернул ошибку
+- `500` - внутренняя ошибка сервиса
 
-## Настройка Power Automate
-
-Создайте cloud flow.
-
-### Trigger
-
-Connector:
-
-```text
-Office 365 Outlook
-```
+### Настройка Power Automate
 
 Trigger:
 
 ```text
-When a new email arrives (V3)
+Office 365 Outlook - When a new email arrives (V3)
 ```
 
 Mailbox:
@@ -203,15 +223,10 @@ Mailbox:
 dmitry.vaisman@metropolinet.co.il
 ```
 
-Фильтрацию лучше делать в Power Automate, чтобы сервис получал только нужные задачи:
+Фильтр:
 
-- для темы используйте поле `Subject Filter` со значением `TODO`, если оно доступно в вашей версии trigger
-- для конкретного отправителя используйте `From` / advanced options, если доступно
-- если нужного поля нет, добавьте action `Condition` после trigger:
-  - `From Address` equals `sender@example.com`
-  - или `Subject` contains `TODO`
-
-### Action
+- `Subject Filter`: `TODO`, если поле доступно
+- или action `Condition`: `Subject` contains `TODO`
 
 Action:
 
@@ -251,92 +266,73 @@ Body:
 }
 ```
 
-В интерфейсе Power Automate подставьте эти значения через Dynamic content:
-
-- `From Address`
-- `Subject`
-- `Received Time`
-- `Body Preview`
-
-Поле `bodyPreview` принимается для совместимости, но сервис не отправляет его в Telegram и не логирует его.
+`bodyPreview` принимается для совместимости, но сервис не отправляет его в Telegram и не логирует его.
 
 ## Deploy на Render
 
-1. Создайте новый Web Service.
-2. Подключите репозиторий с этим проектом.
-3. Render может использовать `render.yaml` из проекта. Если настраиваете вручную, укажите:
+1. Создайте Web Service из GitHub repository.
+2. Render может использовать `render.yaml`. Если настраиваете вручную:
 
 ```text
 Build Command: npm install
 Start Command: npm start
 ```
 
-4. Добавьте environment variables:
+3. Для Graph polling добавьте environment variables:
 
 ```text
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
+GRAPH_POLLING_ENABLED=true
+GRAPH_POLL_INTERVAL_SECONDS=120
+GRAPH_LOOKBACK_MINUTES=5
+TODO_SUBJECT_KEYWORD=TODO
+MS_TENANT_ID
+MS_CLIENT_ID
+MS_CLIENT_SECRET
+MS_REFRESH_TOKEN
+MS_MAILBOX_USER
+```
+
+4. Для webhook режима дополнительно добавьте:
+
+```text
 SHARED_SECRET
 ```
 
-5. Render выдаст публичный HTTPS URL. Используйте:
+5. Health URL:
 
 ```text
-https://your-render-app.onrender.com/webhook/power-automate
+https://your-render-app.onrender.com/health
 ```
 
 ## Deploy на Railway
 
-1. Создайте новый project из GitHub repository.
+1. Создайте project из GitHub repository.
 2. Railway обычно определит Node.js автоматически.
-3. Добавьте Variables:
-
-```text
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
-SHARED_SECRET
-```
-
+3. Добавьте Variables из раздела Render.
 4. Start command:
 
 ```text
 npm start
 ```
 
-5. Сгенерируйте публичный domain и используйте:
-
-```text
-https://your-railway-domain.up.railway.app/webhook/power-automate
-```
-
 ## Deploy на Azure App Service
 
 1. Создайте App Service с runtime Node.js 18 или новее.
 2. Загрузите проект через GitHub Deployment, ZIP deploy или Azure CLI.
-3. В Configuration -> Application settings добавьте:
-
-```text
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
-SHARED_SECRET
-```
-
+3. В Configuration -> Application settings добавьте variables из раздела Render.
 4. Startup command:
 
 ```text
 npm start
 ```
 
-5. Endpoint:
-
-```text
-https://your-app-name.azurewebsites.net/webhook/power-automate
-```
-
 ## Безопасность и приватность
 
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SHARED_SECRET` хранятся только в переменных окружения.
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SHARED_SECRET`, `MS_CLIENT_SECRET`, `MS_REFRESH_TOKEN` хранятся только в переменных окружения.
 - `.env` добавлен в `.gitignore`.
 - Сервис не сохраняет письма в базу данных.
-- Сервис не логирует `bodyPreview` или полный текст письма.
-- В логах остаётся только техническая информация: результат отправки, отправитель, длина темы и время получения.
+- Сервис не запрашивает и не логирует тело письма.
+- В логах остаётся только техническая информация: результат отправки, message id, отправитель, длина темы и время получения.
+- Если token был случайно отправлен в чат или опубликован, его нужно сразу перевыпустить.
