@@ -291,6 +291,12 @@ async function pollGmailInbox() {
       },
       logger: false,
     });
+    client.on('error', (error) => {
+      console.warn(`[${requestId}] Gmail IMAP client error`, {
+        message: error.message,
+        code: error.code,
+      });
+    });
 
     await client.connect();
     await client.mailboxOpen(GMAIL_IMAP_MAILBOX, { readOnly: false });
