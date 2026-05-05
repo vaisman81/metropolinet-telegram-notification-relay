@@ -1,15 +1,17 @@
 {
   "name": "metropolinet-telegram-notification-relay",
   "version": "1.0.0",
-  "description": "Small Express relay for Power Automate email webhooks to Telegram notifications.",
+  "description": "Small Express relay for Outlook task email notifications to Telegram.",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "auth:microsoft": "node scripts/get-microsoft-refresh-token.js"
   },
   "keywords": [
     "telegram",
+    "microsoft-graph",
     "power-automate",
     "outlook",
     "notifications",
