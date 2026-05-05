@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import express from 'express';
 
 const {
@@ -7,13 +9,36 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   SHARED_SECRET,
+  GRAPH_POLLING_ENABLED = 'false',
+  GRAPH_POLL_INTERVAL_SECONDS = '120',
+  GRAPH_LOOKBACK_MINUTES = '5',
+  GRAPH_STATE_FILE = '.data/graph-state.json',
+  TODO_SUBJECT_KEYWORD = 'TODO',
+  MS_TENANT_ID,
+  MS_CLIENT_ID,
+  MS_CLIENT_SECRET,
+  MS_REFRESH_TOKEN,
+  MS_MAILBOX_USER = 'me',
 } = process.env;
 
 const REQUIRED_ENV = {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-  SHARED_SECRET,
 };
+
+const isGraphPollingEnabled = GRAPH_POLLING_ENABLED.toLowerCase() === 'true';
+
+if (SHARED_SECRET) {
+  REQUIRED_ENV.SHARED_SECRET = SHARED_SECRET;
+}
+
+if (isGraphPollingEnabled) {
+  Object.assign(REQUIRED_ENV, {
+    MS_TENANT_ID,
+    MS_CLIENT_ID,
+    MS_REFRESH_TOKEN,
+  });
+}
 
 const missingEnv = Object.entries(REQUIRED_ENV)
   .filter(([, value]) => !value)
@@ -24,7 +49,14 @@ if (missingEnv.length > 0) {
   process.exit(1);
 }
 
+if (!SHARED_SECRET) {
+  console.warn('SHARED_SECRET is not set. The Power Automate webhook endpoint is disabled.');
+}
+
 const app = express();
+let graphPollTimer;
+let graphPollInProgress = false;
+let currentMicrosoftRefreshToken = MS_REFRESH_TOKEN;
 
 app.use(
   express.json({
@@ -39,6 +71,11 @@ app.get('/health', (_req, res) => {
 
 app.post('/webhook/power-automate', async (req, res) => {
   const requestId = randomUUID();
+
+  if (!SHARED_SECRET) {
+    return res.status(404).json({ ok: false, error: 'webhook_disabled' });
+  }
+
   const secret = req.get('X-Webhook-Secret');
 
   if (secret !== SHARED_SECRET) {
@@ -84,6 +121,10 @@ app.use((err, _req, res, _next) => {
 
 app.listen(Number(PORT), () => {
   console.info(`Notification relay is listening on port ${PORT}`);
+
+  if (isGraphPollingEnabled) {
+    startGraphPolling();
+  }
 });
 
 function validateWebhookPayload(payload) {
@@ -186,4 +227,223 @@ async function readTelegramResponse(response) {
   } catch {
     return null;
   }
+}
+
+function startGraphPolling() {
+  const intervalMs = Math.max(Number(GRAPH_POLL_INTERVAL_SECONDS) || 120, 30) * 1000;
+
+  console.info('Microsoft Graph polling is enabled', {
+    mailbox: MS_MAILBOX_USER,
+    keyword: TODO_SUBJECT_KEYWORD,
+    intervalSeconds: intervalMs / 1000,
+  });
+
+  void pollMicrosoftGraph();
+  graphPollTimer = setInterval(() => {
+    void pollMicrosoftGraph();
+  }, intervalMs);
+  graphPollTimer.unref?.();
+}
+
+async function pollMicrosoftGraph() {
+  if (graphPollInProgress) {
+    return;
+  }
+
+  const requestId = randomUUID();
+  graphPollInProgress = true;
+
+  try {
+    const state = await loadGraphState();
+    const since = state.lastReceivedDateTime || getInitialGraphSince();
+    const accessToken = await getMicrosoftAccessToken();
+    const messages = await fetchRecentInboxMessages(accessToken, since);
+    const todoMessages = messages.filter(isTodoMessage);
+
+    for (const message of todoMessages) {
+      if (state.seenMessageIds.includes(message.id)) {
+        continue;
+      }
+
+      const from = getGraphMessageSender(message);
+      const subject = normalizeString(message.subject) || '(без темы)';
+      const received = normalizeString(message.receivedDateTime);
+
+      await sendTelegramMessage(formatTelegramMessage({ from, subject, received }));
+
+      state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
+      state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, message.id]);
+      await saveGraphState(state);
+
+      console.info(`[${requestId}] Graph TODO notification sent`, {
+        messageId: message.id,
+        from,
+        subjectLength: subject.length,
+        received,
+      });
+    }
+
+    if (messages.length > 0) {
+      const latestReceived = messages
+        .map((message) => normalizeString(message.receivedDateTime))
+        .filter(Boolean)
+        .reduce(maxIsoDate, state.lastReceivedDateTime);
+
+      if (latestReceived !== state.lastReceivedDateTime) {
+        state.lastReceivedDateTime = latestReceived;
+        await saveGraphState(state);
+      }
+    }
+  } catch (error) {
+    console.error(`[${requestId}] Microsoft Graph polling error`, {
+      message: error.message,
+      status: error.status,
+      graphCode: error.graphCode,
+    });
+  } finally {
+    graphPollInProgress = false;
+  }
+}
+
+async function getMicrosoftAccessToken() {
+  const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(MS_TENANT_ID)}/oauth2/v2.0/token`;
+  const body = new URLSearchParams({
+    client_id: MS_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: currentMicrosoftRefreshToken,
+    scope: 'offline_access User.Read Mail.Read',
+  });
+
+  if (MS_CLIENT_SECRET) {
+    body.set('client_secret', MS_CLIENT_SECRET);
+  }
+
+  const response = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
+  });
+
+  const responseBody = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const error = new Error('Microsoft token refresh failed');
+    error.status = response.status;
+    error.graphCode = responseBody?.error;
+    throw error;
+  }
+
+  if (responseBody.refresh_token) {
+    currentMicrosoftRefreshToken = responseBody.refresh_token;
+  }
+
+  return responseBody.access_token;
+}
+
+async function fetchRecentInboxMessages(accessToken, since) {
+  const userPath =
+    MS_MAILBOX_USER.toLowerCase() === 'me'
+      ? 'me'
+      : `users/${encodeURIComponent(MS_MAILBOX_USER)}`;
+  const url = new URL(`https://graph.microsoft.com/v1.0/${userPath}/mailFolders/inbox/messages`);
+
+  url.searchParams.set('$top', '25');
+  url.searchParams.set('$select', 'id,subject,from,receivedDateTime');
+  url.searchParams.set('$orderby', 'receivedDateTime asc');
+  url.searchParams.set('$filter', `receivedDateTime ge ${since}`);
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Prefer: 'outlook.body-content-type="text"',
+    },
+  });
+
+  const responseBody = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const error = new Error('Microsoft Graph messages request failed');
+    error.status = response.status;
+    error.graphCode = responseBody?.error?.code;
+    throw error;
+  }
+
+  return Array.isArray(responseBody?.value) ? responseBody.value : [];
+}
+
+function isTodoMessage(message) {
+  const subject = normalizeString(message.subject).toLowerCase();
+  return subject.includes(TODO_SUBJECT_KEYWORD.toLowerCase());
+}
+
+function getGraphMessageSender(message) {
+  return (
+    normalizeString(message.from?.emailAddress?.address) ||
+    normalizeString(message.from?.emailAddress?.name) ||
+    'unknown'
+  );
+}
+
+async function loadGraphState() {
+  try {
+    const raw = await readFile(GRAPH_STATE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    return {
+      lastReceivedDateTime: normalizeString(parsed.lastReceivedDateTime),
+      seenMessageIds: Array.isArray(parsed.seenMessageIds)
+        ? parsed.seenMessageIds.filter((id) => typeof id === 'string')
+        : [],
+    };
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.warn('Could not read Graph state file, starting with fresh state', {
+        message: error.message,
+      });
+    }
+
+    return {
+      lastReceivedDateTime: '',
+      seenMessageIds: [],
+    };
+  }
+}
+
+async function saveGraphState(state) {
+  await mkdir(path.dirname(GRAPH_STATE_FILE), { recursive: true });
+  await writeFile(
+    GRAPH_STATE_FILE,
+    `${JSON.stringify(
+      {
+        lastReceivedDateTime: state.lastReceivedDateTime,
+        seenMessageIds: trimSeenMessageIds(state.seenMessageIds),
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+}
+
+function getInitialGraphSince() {
+  const lookbackMinutes = Math.max(Number(GRAPH_LOOKBACK_MINUTES) || 0, 0);
+  return new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
+}
+
+function maxIsoDate(current, next) {
+  if (!current) {
+    return next;
+  }
+
+  if (!next) {
+    return current;
+  }
+
+  return new Date(next).getTime() > new Date(current).getTime() ? next : current;
+}
+
+function trimSeenMessageIds(ids) {
+  return [...new Set(ids)].slice(-200);
 }
