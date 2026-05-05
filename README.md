@@ -34,8 +34,11 @@ Power Automate отправляет HTTP POST:
 - Telegram bot token
 - Telegram chat_id
 - Любой публичный HTTPS endpoint для Power Automate: Render, Railway, Azure App Service или другой хостинг
+- Power Automate plan/trial, который разрешает action `HTTP`
 
 Платные внешние API не используются.
+
+Важно: в Power Automate action `HTTP` может требовать premium plan или trial. Если flow получает состояние `Suspended` с причиной `BillingConsumption`, Outlook connection уже может быть рабочим, но сам flow не включится до активации подходящего Power Automate plan/trial или pay-as-you-go billing.
 
 ## Установка
 
