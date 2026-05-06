@@ -445,22 +445,34 @@ function getGmailSearchSince(lastReceivedDateTime) {
 function matchesGmailFilters({ from, subject }) {
   const normalizedSubject = normalizeString(subject).toLowerCase();
   const normalizedFrom = normalizeString(from).toLowerCase();
-  const fromFilter = normalizeString(GMAIL_FILTER_FROM_CONTAINS).toLowerCase();
-  const subjectFilter = normalizeString(GMAIL_FILTER_SUBJECT_CONTAINS).toLowerCase();
+  const fromFilters = parseFilterTerms(GMAIL_FILTER_FROM_CONTAINS);
+  const subjectFilters = parseFilterTerms(GMAIL_FILTER_SUBJECT_CONTAINS);
 
-  if (fromFilter && !normalizedFrom.includes(fromFilter)) {
+  if (fromFilters.length > 0 && !includesAnyTerm(normalizedFrom, fromFilters)) {
     return false;
   }
 
-  if (subjectFilter && !normalizedSubject.includes(subjectFilter)) {
+  if (subjectFilters.length > 0 && !includesAnyTerm(normalizedSubject, subjectFilters)) {
     return false;
   }
 
-  if (!fromFilter && !subjectFilter) {
+  if (fromFilters.length === 0 && subjectFilters.length === 0) {
     return normalizedSubject.includes(TODO_SUBJECT_KEYWORD.toLowerCase());
   }
 
   return true;
+}
+
+function parseFilterTerms(value) {
+  return normalizeString(value)
+    .toLowerCase()
+    .split(/[,\n;]/)
+    .map((term) => term.trim())
+    .filter(Boolean);
+}
+
+function includesAnyTerm(value, terms) {
+  return terms.some((term) => value.includes(term));
 }
 
 function startGraphPolling() {
