@@ -121,6 +121,7 @@ GMAIL_IMAP_MAILBOX=INBOX
 GMAIL_IMAP_MARK_SEEN=true
 GMAIL_INCLUDE_SEEN=true
 GMAIL_LOOKBACK_MINUTES=1440
+GMAIL_FILTER_SUBJECT_CONTAINS=TODO,has been assigned to you
 
 TODO_SUBJECT_KEYWORD=TODO
 ```
@@ -128,7 +129,7 @@ TODO_SUBJECT_KEYWORD=TODO
 Как это работает:
 
 - сервис ищет свежие письма в Gmail Inbox, включая уже прочитанные, и отсекает повторы по Message-ID;
-- если в теме есть `TODO`, шлет уведомление в Telegram;
+- если в теме есть `TODO` или другой текст из `GMAIL_FILTER_SUBJECT_CONTAINS`, шлет уведомление в Telegram;
 - после успешной отправки может пометить письмо как `Seen`;
 - хранит только техническое состояние в `.data/gmail-state.json`.
 
