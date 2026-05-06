@@ -21,6 +21,8 @@ const {
   GMAIL_IMAP_MAILBOX = 'INBOX',
   GMAIL_IMAP_MARK_SEEN = 'true',
   GMAIL_BOOTSTRAP_SKIP_EXISTING = 'false',
+  GMAIL_INCLUDE_SEEN = 'true',
+  GMAIL_LOOKBACK_MINUTES = '1440',
   GMAIL_FILTER_FROM_CONTAINS = '',
   GMAIL_FILTER_SUBJECT_CONTAINS = '',
   GRAPH_POLLING_ENABLED = 'false',
@@ -280,6 +282,8 @@ function startGmailPolling() {
     username: GMAIL_IMAP_USER,
     fromFilter: GMAIL_FILTER_FROM_CONTAINS,
     subjectFilter: GMAIL_FILTER_SUBJECT_CONTAINS,
+    includeSeen: GMAIL_INCLUDE_SEEN,
+    lookbackMinutes: GMAIL_LOOKBACK_MINUTES,
     intervalSeconds: intervalMs / 1000,
   });
 
@@ -300,6 +304,7 @@ async function pollGmailInbox() {
 
   try {
     const state = await loadMessageState(GMAIL_STATE_FILE);
+    let stateChanged = false;
     const client = new ImapFlow({
       host: GMAIL_IMAP_HOST,
       port: Number(GMAIL_IMAP_PORT),
@@ -320,13 +325,13 @@ async function pollGmailInbox() {
     await client.connect();
     await client.mailboxOpen(GMAIL_IMAP_MAILBOX, { readOnly: false });
 
-    const unseen = await client.search({ seen: false });
+    const candidateUids = await client.search(buildGmailSearchQuery(state));
     const hasExistingState = state.seenMessageIds.length > 0 || Boolean(state.lastReceivedDateTime);
 
-    if (!hasExistingState && GMAIL_BOOTSTRAP_SKIP_EXISTING.toLowerCase() === 'true' && unseen.length > 0) {
+    if (!hasExistingState && GMAIL_BOOTSTRAP_SKIP_EXISTING.toLowerCase() === 'true' && candidateUids.length > 0) {
       const seededMessageIds = [];
 
-      for (const uid of unseen) {
+      for (const uid of candidateUids) {
         const message = await client.fetchOne(uid, {
           uid: true,
           envelope: true,
@@ -348,7 +353,7 @@ async function pollGmailInbox() {
       return;
     }
 
-    for (const uid of unseen) {
+    for (const uid of [...candidateUids].sort((a, b) => a - b)) {
       const message = await client.fetchOne(uid, {
         uid: true,
         envelope: true,
@@ -367,6 +372,11 @@ async function pollGmailInbox() {
       const received = message?.internalDate?.toISOString() || new Date().toISOString();
 
       if (!matchesGmailFilters({ from, subject })) {
+        const lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
+        if (lastReceivedDateTime !== state.lastReceivedDateTime) {
+          state.lastReceivedDateTime = lastReceivedDateTime;
+          stateChanged = true;
+        }
         continue;
       }
 
@@ -378,6 +388,7 @@ async function pollGmailInbox() {
 
       state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
       state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, messageId]);
+      stateChanged = true;
       await saveMessageState(GMAIL_STATE_FILE, state);
 
       console.info(`[${requestId}] Gmail filtered notification sent`, {
@@ -387,6 +398,10 @@ async function pollGmailInbox() {
         subjectLength: subject.length,
         received,
       });
+    }
+
+    if (stateChanged) {
+      await saveMessageState(GMAIL_STATE_FILE, state);
     }
 
     await client.logout();
@@ -403,6 +418,28 @@ async function pollGmailInbox() {
 function getImapEnvelopeSender(envelope) {
   const sender = envelope?.from?.[0];
   return normalizeString(sender?.address) || normalizeString(sender?.name) || 'unknown';
+}
+
+function buildGmailSearchQuery(state) {
+  if (GMAIL_INCLUDE_SEEN.toLowerCase() !== 'true') {
+    return { seen: false };
+  }
+
+  return {
+    since: getGmailSearchSince(state.lastReceivedDateTime),
+  };
+}
+
+function getGmailSearchSince(lastReceivedDateTime) {
+  const stateDate = new Date(lastReceivedDateTime);
+
+  if (!Number.isNaN(stateDate.getTime())) {
+    // IMAP SINCE is day-granular, so overlap intentionally and skip duplicates by Message-ID.
+    return new Date(stateDate.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  const lookbackMinutes = Math.max(Number(GMAIL_LOOKBACK_MINUTES) || 0, 30);
+  return new Date(Date.now() - lookbackMinutes * 60 * 1000);
 }
 
 function matchesGmailFilters({ from, subject }) {
