@@ -25,6 +25,7 @@ const {
   GMAIL_LOOKBACK_MINUTES = '1440',
   GMAIL_FILTER_FROM_CONTAINS = '',
   GMAIL_FILTER_SUBJECT_CONTAINS = '',
+  GMAIL_POLLING_RULES = '',
   GRAPH_POLLING_ENABLED = 'false',
   GRAPH_POLL_INTERVAL_SECONDS = '120',
   GRAPH_LOOKBACK_MINUTES = '5',
@@ -194,17 +195,23 @@ function normalizeString(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function formatTelegramMessage({ from, subject, received }) {
+function formatTelegramMessage({
+  from,
+  subject,
+  received,
+  title = TELEGRAM_ALERT_TITLE,
+  includeDetails = TELEGRAM_INCLUDE_DETAILS.toLowerCase() === 'true',
+}) {
   const ticketId = extractTicketId(subject);
 
-  if (TELEGRAM_INCLUDE_DETAILS.toLowerCase() !== 'true') {
+  if (!includeDetails) {
     return ticketId
-      ? `${escapeHtml(TELEGRAM_ALERT_TITLE)}: <b>${escapeHtml(ticketId)}</b>`
-      : escapeHtml(TELEGRAM_ALERT_TITLE);
+      ? `${escapeHtml(title)}: <b>${escapeHtml(ticketId)}</b>`
+      : escapeHtml(title);
   }
 
   return [
-    `<b>${escapeHtml(TELEGRAM_ALERT_TITLE)}</b>`,
+    `<b>${escapeHtml(title)}</b>`,
     `От: ${escapeHtml(from)}`,
     `Тема: ${escapeHtml(subject)}`,
     `Получено: ${escapeHtml(formatReceivedTime(received))}`,
@@ -276,14 +283,19 @@ async function readTelegramResponse(response) {
 
 function startGmailPolling() {
   const intervalMs = Math.max(Number(GMAIL_POLL_INTERVAL_SECONDS) || 120, 30) * 1000;
+  const rules = getGmailPollingRules();
 
   console.info('Gmail IMAP polling is enabled', {
-    mailbox: GMAIL_IMAP_MAILBOX,
     username: GMAIL_IMAP_USER,
-    fromFilter: GMAIL_FILTER_FROM_CONTAINS,
-    subjectFilter: GMAIL_FILTER_SUBJECT_CONTAINS,
-    includeSeen: GMAIL_INCLUDE_SEEN,
-    lookbackMinutes: GMAIL_LOOKBACK_MINUTES,
+    rules: rules.map((rule) => ({
+      id: rule.id,
+      mailbox: rule.mailbox,
+      fromFilter: rule.fromContains,
+      subjectFilter: rule.subjectContains,
+      matchAll: rule.matchAll,
+      includeSeen: rule.includeSeen,
+      lookbackMinutes: rule.lookbackMinutes,
+    })),
     intervalSeconds: intervalMs / 1000,
   });
 
@@ -304,7 +316,7 @@ async function pollGmailInbox() {
 
   try {
     const state = await loadMessageState(GMAIL_STATE_FILE);
-    let stateChanged = false;
+    const rules = getGmailPollingRules();
     const client = new ImapFlow({
       host: GMAIL_IMAP_HOST,
       port: Number(GMAIL_IMAP_PORT),
@@ -323,85 +335,10 @@ async function pollGmailInbox() {
     });
 
     await client.connect();
-    await client.mailboxOpen(GMAIL_IMAP_MAILBOX, { readOnly: false });
-
-    const candidateUids = await client.search(buildGmailSearchQuery(state));
     const hasExistingState = state.seenMessageIds.length > 0 || Boolean(state.lastReceivedDateTime);
 
-    if (!hasExistingState && GMAIL_BOOTSTRAP_SKIP_EXISTING.toLowerCase() === 'true' && candidateUids.length > 0) {
-      const seededMessageIds = [];
-
-      for (const uid of candidateUids) {
-        const message = await client.fetchOne(uid, {
-          uid: true,
-          envelope: true,
-          internalDate: true,
-        });
-        const messageId = normalizeString(message?.envelope?.messageId) || `uid:${uid}`;
-        const received = message?.internalDate?.toISOString() || '';
-        seededMessageIds.push(messageId);
-        state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
-      }
-
-      state.seenMessageIds = trimSeenMessageIds(seededMessageIds);
-      await saveMessageState(GMAIL_STATE_FILE, state);
-      console.info(`[${requestId}] Seeded Gmail state without sending notifications`, {
-        mailbox: GMAIL_IMAP_MAILBOX,
-        seededCount: seededMessageIds.length,
-      });
-      await client.logout();
-      return;
-    }
-
-    for (const uid of [...candidateUids].sort((a, b) => a - b)) {
-      const message = await client.fetchOne(uid, {
-        uid: true,
-        envelope: true,
-        internalDate: true,
-        flags: true,
-      });
-
-      const messageId = normalizeString(message?.envelope?.messageId) || `uid:${uid}`;
-      const subject = normalizeString(message?.envelope?.subject);
-
-      if (state.seenMessageIds.includes(messageId)) {
-        continue;
-      }
-
-      const from = getImapEnvelopeSender(message?.envelope);
-      const received = message?.internalDate?.toISOString() || new Date().toISOString();
-
-      if (!matchesGmailFilters({ from, subject })) {
-        const lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
-        if (lastReceivedDateTime !== state.lastReceivedDateTime) {
-          state.lastReceivedDateTime = lastReceivedDateTime;
-          stateChanged = true;
-        }
-        continue;
-      }
-
-      await sendTelegramMessage(formatTelegramMessage({ from, subject, received }));
-
-      if (GMAIL_IMAP_MARK_SEEN.toLowerCase() === 'true') {
-        await client.messageFlagsAdd(uid, ['\\Seen']);
-      }
-
-      state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
-      state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, messageId]);
-      stateChanged = true;
-      await saveMessageState(GMAIL_STATE_FILE, state);
-
-      console.info(`[${requestId}] Gmail filtered notification sent`, {
-        uid,
-        messageId,
-        from,
-        subjectLength: subject.length,
-        received,
-      });
-    }
-
-    if (stateChanged) {
-      await saveMessageState(GMAIL_STATE_FILE, state);
+    for (const rule of rules) {
+      await processGmailRule({ client, state, rule, requestId, hasExistingState });
     }
 
     await client.logout();
@@ -415,38 +352,204 @@ async function pollGmailInbox() {
   }
 }
 
+async function processGmailRule({ client, state, rule, requestId, hasExistingState }) {
+  await client.mailboxOpen(rule.mailbox, { readOnly: false });
+
+  const candidateUids = await client.search(buildGmailSearchQuery(rule));
+
+  if (!hasExistingState && rule.bootstrapSkipExisting && candidateUids.length > 0) {
+    const seededMessageIds = [];
+
+    for (const uid of candidateUids) {
+      const message = await client.fetchOne(uid, {
+        uid: true,
+        envelope: true,
+        internalDate: true,
+      });
+      const messageId = getImapMessageId(message, rule, uid);
+      const received = message?.internalDate?.toISOString() || '';
+      seededMessageIds.push(messageId);
+      state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
+    }
+
+    state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, ...seededMessageIds]);
+    await saveMessageState(GMAIL_STATE_FILE, state);
+    console.info(`[${requestId}] Seeded Gmail state without sending notifications`, {
+      ruleId: rule.id,
+      mailbox: rule.mailbox,
+      seededCount: seededMessageIds.length,
+    });
+    return;
+  }
+
+  let stateChanged = false;
+
+  for (const uid of [...candidateUids].sort((a, b) => a - b)) {
+    const message = await client.fetchOne(uid, {
+      uid: true,
+      envelope: true,
+      internalDate: true,
+      flags: true,
+    });
+
+    const messageId = getImapMessageId(message, rule, uid);
+    const subject = normalizeString(message?.envelope?.subject);
+
+    if (state.seenMessageIds.includes(messageId)) {
+      continue;
+    }
+
+    const from = getImapEnvelopeSender(message?.envelope);
+    const received = message?.internalDate?.toISOString() || new Date().toISOString();
+
+    if (!matchesGmailFilters({ from, subject, rule })) {
+      continue;
+    }
+
+    await sendTelegramMessage(
+      formatTelegramMessage({
+        from,
+        subject,
+        received,
+        title: rule.title,
+        includeDetails: rule.includeDetails,
+      }),
+    );
+
+    if (rule.markSeen) {
+      await client.messageFlagsAdd(uid, ['\\Seen']);
+    }
+
+    state.lastReceivedDateTime = maxIsoDate(state.lastReceivedDateTime, received);
+    state.seenMessageIds = trimSeenMessageIds([...state.seenMessageIds, messageId]);
+    stateChanged = true;
+    await saveMessageState(GMAIL_STATE_FILE, state);
+
+    console.info(`[${requestId}] Gmail notification sent`, {
+      ruleId: rule.id,
+      mailbox: rule.mailbox,
+      uid,
+      messageId,
+      from,
+      subjectLength: subject.length,
+      received,
+    });
+  }
+
+  if (stateChanged) {
+    await saveMessageState(GMAIL_STATE_FILE, state);
+  }
+}
+
 function getImapEnvelopeSender(envelope) {
   const sender = envelope?.from?.[0];
   return normalizeString(sender?.address) || normalizeString(sender?.name) || 'unknown';
 }
 
-function buildGmailSearchQuery(state) {
-  if (GMAIL_INCLUDE_SEEN.toLowerCase() !== 'true') {
+function getImapMessageId(message, rule, uid) {
+  return normalizeString(message?.envelope?.messageId) || `${rule.mailbox}:uid:${uid}`;
+}
+
+function getGmailPollingRules() {
+  const configuredRules = parseGmailPollingRules();
+  const rawRules =
+    configuredRules.length > 0
+      ? configuredRules
+      : [
+          {
+            id: 'default',
+            mailbox: GMAIL_IMAP_MAILBOX,
+            fromContains: GMAIL_FILTER_FROM_CONTAINS,
+            subjectContains: GMAIL_FILTER_SUBJECT_CONTAINS,
+            title: TELEGRAM_ALERT_TITLE,
+            includeDetails: TELEGRAM_INCLUDE_DETAILS,
+            markSeen: GMAIL_IMAP_MARK_SEEN,
+            includeSeen: GMAIL_INCLUDE_SEEN,
+            lookbackMinutes: GMAIL_LOOKBACK_MINUTES,
+            bootstrapSkipExisting: GMAIL_BOOTSTRAP_SKIP_EXISTING,
+          },
+        ];
+
+  return rawRules.map((rule, index) => normalizeGmailRule(rule, index));
+}
+
+function parseGmailPollingRules() {
+  if (!normalizeString(GMAIL_POLLING_RULES)) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(GMAIL_POLLING_RULES);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    console.warn('Could not parse GMAIL_POLLING_RULES, falling back to legacy Gmail env vars', {
+      message: error.message,
+    });
+    return [];
+  }
+}
+
+function normalizeGmailRule(rule, index) {
+  const mailbox = normalizeString(rule.mailbox) || GMAIL_IMAP_MAILBOX;
+  const fromContains = normalizeString(rule.fromContains ?? rule.from ?? GMAIL_FILTER_FROM_CONTAINS);
+  const subjectContains = normalizeString(
+    rule.subjectContains ?? rule.subject ?? GMAIL_FILTER_SUBJECT_CONTAINS,
+  );
+
+  return {
+    id: normalizeString(rule.id) || `rule-${index + 1}`,
+    mailbox,
+    fromContains,
+    subjectContains,
+    matchAll: toBoolean(rule.matchAll, false),
+    title: normalizeString(rule.title) || TELEGRAM_ALERT_TITLE,
+    includeDetails: toBoolean(rule.includeDetails, TELEGRAM_INCLUDE_DETAILS.toLowerCase() === 'true'),
+    markSeen: toBoolean(rule.markSeen, GMAIL_IMAP_MARK_SEEN.toLowerCase() === 'true'),
+    includeSeen: toBoolean(rule.includeSeen, GMAIL_INCLUDE_SEEN.toLowerCase() === 'true'),
+    lookbackMinutes: Math.max(Number(rule.lookbackMinutes ?? GMAIL_LOOKBACK_MINUTES) || 0, 30),
+    bootstrapSkipExisting: toBoolean(
+      rule.bootstrapSkipExisting,
+      GMAIL_BOOTSTRAP_SKIP_EXISTING.toLowerCase() === 'true',
+    ),
+  };
+}
+
+function toBoolean(value, defaultValue) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    return value.toLowerCase() === 'true';
+  }
+
+  return defaultValue;
+}
+
+function buildGmailSearchQuery(rule) {
+  if (!rule.includeSeen) {
     return { seen: false };
   }
 
   return {
-    since: getGmailSearchSince(state.lastReceivedDateTime),
+    since: getGmailSearchSince(rule),
   };
 }
 
-function getGmailSearchSince(lastReceivedDateTime) {
-  const stateDate = new Date(lastReceivedDateTime);
-
-  if (!Number.isNaN(stateDate.getTime())) {
-    // IMAP SINCE is day-granular, so overlap intentionally and skip duplicates by Message-ID.
-    return new Date(stateDate.getTime() - 24 * 60 * 60 * 1000);
-  }
-
-  const lookbackMinutes = Math.max(Number(GMAIL_LOOKBACK_MINUTES) || 0, 30);
-  return new Date(Date.now() - lookbackMinutes * 60 * 1000);
+function getGmailSearchSince(rule) {
+  // IMAP SINCE is day-granular; duplicates are skipped by Message-ID in the state file.
+  return new Date(Date.now() - rule.lookbackMinutes * 60 * 1000);
 }
 
-function matchesGmailFilters({ from, subject }) {
+function matchesGmailFilters({ from, subject, rule }) {
+  if (rule.matchAll) {
+    return true;
+  }
+
   const normalizedSubject = normalizeString(subject).toLowerCase();
   const normalizedFrom = normalizeString(from).toLowerCase();
-  const fromFilters = parseFilterTerms(GMAIL_FILTER_FROM_CONTAINS);
-  const subjectFilters = parseFilterTerms(GMAIL_FILTER_SUBJECT_CONTAINS);
+  const fromFilters = parseFilterTerms(rule.fromContains);
+  const subjectFilters = parseFilterTerms(rule.subjectContains);
 
   if (fromFilters.length > 0 && !includesAnyTerm(normalizedFrom, fromFilters)) {
     return false;
