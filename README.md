@@ -119,13 +119,15 @@ GMAIL_IMAP_USER=dvsoftmaster@gmail.com
 GMAIL_IMAP_PASSWORD=your_gmail_app_password
 GMAIL_IMAP_MAILBOX=INBOX
 GMAIL_IMAP_MARK_SEEN=true
+GMAIL_INCLUDE_SEEN=true
+GMAIL_LOOKBACK_MINUTES=1440
 
 TODO_SUBJECT_KEYWORD=TODO
 ```
 
 Как это работает:
 
-- сервис ищет непрочитанные письма в Gmail Inbox;
+- сервис ищет свежие письма в Gmail Inbox, включая уже прочитанные, и отсекает повторы по Message-ID;
 - если в теме есть `TODO`, шлет уведомление в Telegram;
 - после успешной отправки может пометить письмо как `Seen`;
 - хранит только техническое состояние в `.data/gmail-state.json`.
